@@ -10,16 +10,33 @@ import java.util.concurrent.SynchronousQueue;
 import android.content.pm.PackageManager;
 import android.Manifest;
 import android.webkit.PermissionRequest;
+import android.provider.Settings;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Arrays;
 import java.util.HashSet;
 import android.annotation.TargetApi;
 import android.os.Build;
+import android.content.Context;
+import android.os.PowerManager;
+import android.net.Uri;
+import android.app.NotificationManager;
+
+// import android.app.Service;
+// import android.os.IBinder;
+import android.os.PowerManager;
+import android.os.PowerManager.WakeLock;
+import android.net.wifi.WifiManager.WifiLock;
+import android.net.wifi.WifiManager;
+import android.content.pm.PackageManager;
+import com.gonimo.baby.R;
+import com.gonimo.baby.GonimoRunning;
+import com.gonimo.baby.AndroidCompat;
 
 public class HaskellActivity extends Activity {
   public native int haskellStartMain(SynchronousQueue<Long> setCallbacks);
   public native void haskellOnCreate(long callbacks);
+  public native void haskellOnCreateWithIntent(long callbacks, String intent, String intentdata);
   public native void haskellOnStart(long callbacks);
   public native void haskellOnResume(long callbacks);
   public native void haskellOnPause(long callbacks);
@@ -71,23 +88,125 @@ public class HaskellActivity extends Activity {
       //TODO: Should we do something with this?
     }
   }
+  private boolean isIgnoringBatteryOptimizations() {
+    Context context=this;
+    String packageName = context.getPackageName();
+    PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+    return pm.isIgnoringBatteryOptimizations(packageName);
+  }
+
+  private void askIgnoreBatteryOptimizations() {
+      try {
+        if(isIgnoringBatteryOptimizations())
+            Log.d("HaskellActivity", "We are ignoring doze!!!!! Yeah!");
+        else {
+            Log.d("HaskellActivity", "We are not ignoring doze!!!!! Oh noooooooo!");
+            Intent intentBattery = new Intent( Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                                             , Uri.parse("package:" + getPackageName())
+                                             );
+            // Necessary to prevent it showing up (dead) in the task manager.
+            intentBattery.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+
+            startActivity(intentBattery);
+        }
+      }
+      catch (NoSuchMethodError e) {
+          Log.d("HaskellActivity", "Asking for ignore battery optimizations failed. (Not supported and thus irrelevant ;-) ");
+      }
+  }
+
+    // TODO: Delete, as we no longer show running notifications.
+  private void showRunningNotification() {
+      Notification.Builder templ =
+          new Notification.Builder(this)
+          .setSmallIcon(R.drawable.ic_launcher)
+          .setContentTitle(getString(R.string.gonimo_running));
+      showActionNotification(templ);
+  }
+
+  public void showStoppedWarningNotification() {
+      Notification.Builder templ =
+          new Notification.Builder(this)
+          .setSmallIcon(android.R.drawable.stat_sys_warning)
+          .setContentTitle(getString(R.string.gonimo_must_run_in_the_foreground))
+          .setContentText(getString(R.string.please_switch_back_to_gonimo));
+      showActionNotification(templ);
+  }
+
+  private void showActionNotification(Notification.Builder templ) {
+    Intent intent = new Intent(this, HaskellActivity.class);
+    PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+
+    Intent stopIntent = new Intent(this, HaskellActivity.class);
+    stopIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
+    stopIntent.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+    stopIntent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+    stopIntent.putExtra("com.gonimo.baby.stopIt", true);
+    PendingIntent stopPending = PendingIntent.getActivity(this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+
+    Notification notification = templ
+        .setContentIntent(pendingIntent)
+        .addAction(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.stop_gonimo), stopPending)
+        .setDeleteIntent(stopPending)
+        .build();
+    NotificationManager notificationManager = AndroidCompat.getNotificationManager(this);
+    notificationManager.notify(notificationId, notification);
+  }
 
   @Override
   public void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
+    askIgnoreBatteryOptimizations();
     // We can't call finish() in the constructor, as it will have no effect, so
     // we call it here whenever we reach this code without having hit
     // 'continueWithCallbacks'
+
+    Intent serviceIntent = new Intent(this, GonimoRunning.class);
+    startService(serviceIntent);
+
+    grabWakeLock();
+
     if(callbacks == 0) {
       finish();
     } else {
       haskellOnCreate(callbacks); //TODO: Pass savedInstanceState as well
+      Intent intent = getIntent();
+      String intentDataString = intent == null || intent.getDataString() == null ? "" : intent.getDataString();
+      String intentAction = intent == null || intent.getAction() == null ? "" : intent.getAction();
+      haskellOnCreateWithIntent(callbacks, intentAction, intentDataString); //TODO: Use a more canonical way of passing this data - i.e. pass the Intent and let the Haskell side get the data out with JNI
     }
+  }
+
+  private void grabWakeLock() {
+      PowerManager powerManager = (PowerManager) getApplicationContext().getSystemService(POWER_SERVICE);
+      if (powerManager != null) {
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                                                    "MyWakelockTag");
+        if (wakeLock != null)
+            wakeLock.acquire();
+      }
+
+      WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+      if (wifiManager != null) {
+        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "gonimo-wifi-lock");
+
+        if (wifiLock != null)
+            wifiLock.acquire();
+      }
+  }
+
+  private void releaseWakeLock() {
+      if(wakeLock != null)
+          wakeLock.release();
+      if(wifiLock != null)
+          wifiLock.release();
   }
 
   @Override
   public void onStart() {
     super.onStart();
+    // Warning notification gets shown via Haskell, if a stream or something is running, cancel it now.
+    GonimoRunning.cancelRunningNotification(this);
     if(callbacks != 0) {
       haskellOnStart(callbacks);
     }
@@ -123,6 +242,8 @@ public class HaskellActivity extends Activity {
     if(callbacks != 0) {
       haskellOnDestroy(callbacks);
     }
+    releaseWakeLock();
+    GonimoRunning.cancelRunningNotification(this); // Don't know why this is necessary. We have a service that should have his onTaskRemoved triggered.
     //TODO: Should we call hs_exit somehow here?
     android.os.Process.killProcess(android.os.Process.myPid()); //TODO: Properly handle the process surviving between invocations which means that the Haskell RTS needs to not be initialized twice.
   }
@@ -137,6 +258,10 @@ public class HaskellActivity extends Activity {
 
   @Override
   public void onBackPressed() {
+    if(backEventListener != null) {
+        backEventListener.backButtonClicked();
+        return;
+    }
     if(callbacks != 0) {
       haskellOnBackPressed(callbacks);
     }
@@ -145,6 +270,11 @@ public class HaskellActivity extends Activity {
   @Override
   public void onNewIntent(Intent intent) {
     super.onNewIntent(intent);
+    if(intent != null && intent.getExtras() != null && intent.getExtras().containsKey("com.gonimo.baby.stopIt")) {
+        Log.d("HaskellActivity", "stopIt requested ... stopping");
+        finishAndRemoveTask();
+        return;
+    }
     if(callbacks != 0 && intent != null && intent.getData() != null && intent.getAction() != null) {
       haskellOnNewIntent(callbacks, intent.getAction(), intent.getDataString()); //TODO: Use a more canonical way of passing this data - i.e. pass the Intent and let the Haskell side get the data out with JNI
     }
@@ -237,6 +367,19 @@ public class HaskellActivity extends Activity {
           });
   }
 
+  public interface BackEventListener {
+      void backButtonClicked();
+  }
+
+  public void setBackEventListener(BackEventListener l) {
+      backEventListener = l;
+  }
+
+  private BackEventListener backEventListener = null;
   private HashMap<Integer, PermissionRequest> permissionRequests;
   private int nextRequestCode = 0;
+  final public static int notificationId = 31415926;
+  // private Intent serviceIntent;
+  private WakeLock wakeLock;
+  private WifiLock wifiLock;
 }
